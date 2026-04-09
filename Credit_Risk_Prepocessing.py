@@ -34,7 +34,7 @@ krx_kospi = krx_kospi[['종목코드', '업종명', '시가총액']]
 
 
 
-#DART 재무제표 2020~2025 다운로드 및 전처리
+#DART 재무제표 2019~2025 다운로드 및 전처리
 import keyring 
 import requests
 import zipfile
