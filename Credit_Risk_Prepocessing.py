@@ -213,7 +213,17 @@ for col in amount_cols:
     raw_fs_final[col] = pd.to_numeric(raw_fs_final[col], errors="coerce")
         
 
-#분석용 테이블 
+#분석용 테이블
+"""
+Keep both account_id and account_nm:
+    
+    - account_id: because it is based on XBRL standard account IDs.
+      XBRL (eXtensible Business Reporting Language) is an international standard
+      for digital business and financial reporting.
+
+    - account_nm is retained for human-readable validation.
+""" 
+
 raw_fs_slim = raw_fs_final[
     [
         "bsns_year",
@@ -222,6 +232,7 @@ raw_fs_slim = raw_fs_final[
         "corp_name_master",
         "industry_krx",
         "sj_div",
+        "account_id",
         "account_nm",
         "thstrm_amount",
         "frmtrm_amount"
@@ -231,8 +242,6 @@ raw_fs_slim = raw_fs_final[
 print(raw_fs_slim.dtypes)
 print(raw_fs_slim[["thstrm_amount", "frmtrm_amount"]].isna().sum())
 print(f"Final number of firms: {firm_master_final['corp_code'].nunique()}")
-
-
 
 
 #데이터 저장하기
