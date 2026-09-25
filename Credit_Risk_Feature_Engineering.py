@@ -1,360 +1,472 @@
 """
-Credit Risk Feature Engineering - Financial Statement Mapping
+Credit Risk Feature Engineering
 
 Purpose:
-    Transform DART raw financial statement line items into a standardized
-    firm-year panel for credit risk analysis.
+- Transform annual consolidated financial statement accounts into a
+  standardized firm-year panel for financial vulnerability screening.
+- Calculate core financial ratios and report data-quality diagnostics.
 
 Input:
-    - credit_raw_fs_slim.csv
-    - This file is produced by Credit_Risk_Preprocessing.py
+- data/credit_raw_fs_slim.csv, produced by Credit_Risk_Preprocessing.py.
 
-Main steps:
-    1. Load the raw slim financial statement data.
-    2. Keep only core financial statements (BS, IS, CIS, CF) and only IFRS/DART account IDs.
-    3. Examine account coverage across firms and years.
-    4. Map selected raw accounts into standardized analysis variables.
-    5. Resolve IS/CIS overlap with a statement-priority rule.
-    6. Remove duplicate firm-year-standard-account observations.
-    7. Pivot the long-format data into a one-row-per-firm-year panel.
-    8. Compute core credit-risk ratios.
-    9. Validate duplicates, missingness, ratio behavior, and balance-sheet consistency.
-    10. Save the final feature table for downstream credit risk analysis.
+Output:
+- data/credit_features.csv, containing firm identifiers, 12 financial
+  variables, 11 financial ratios, and balance sheet consistency measures.
 
-Core design choices:
-    - Preserve the original raw data.
-    - Exclude SCE in the first-stage model because it contains repeated capital-component-level lines 
-      and is less efficient for building a comparable core credit-risk panel.
-    - Use only BS / IS / CIS / CF in the first-stage ratio framework.
-    - Standardize accounts using sj_div + account_id.
-    - Use a priority rule because IS and CIS can coexist.
-    - Map ifrs-full_FinanceCosts to finance_costs rather than interest_expense.
+Account selection and mapping:
+- Retain BS, IS, CIS, and CF rows with IFRS/DART account IDs.
+- Exclude SCE because the selected financial variables do not require it.
+- Summarize account presence and inspect interest- and finance-related
+  candidates before applying the manual mapping.
+- Map accounts using the combination of sj_div and account_id.
+- Account presence does not guarantee a non-missing financial amount.
 
-Note:
-    - finance_costs is used as a proxy for interest-related burden.
-    - Validation blocks are intentionally retained so that the preprocessing logic 
-      remains transparent, reusable, and easy to audit later.
+Duplicate handling:
+- Stop if multiple rows map to the same variable within a firm-year
+  and statement.
+- Compare available IS and CIS amounts and report discrepancies.
+- Select one observation per firm-year and variable, preferring
+  non-missing amounts, then CIS over IS.
+
+Ratio definitions and missing values:
+- Use current-period amounts (thstrm_amount).
+- ROA and ROE use year-end assets and equity.
+- Quick ratio is calculated as (current assets - inventory)
+  / current liabilities.
+- Finance-cost coverage uses operating income / finance costs.
+  Finance costs may include items beyond pure interest expense.
+- Calculate ratios only when denominators are positive.
+- Preserve missing values and negative numerators.
+- Keep the underlying financial amounts unchanged.
+
+Validation:
+- Report account coverage, IS/CIS overlap, and panel missingness.
+- Summarize ratio distributions after denominator treatment.
+- Check assets = liabilities + equity using both signed monetary
+  differences and absolute differences relative to total assets.
+- Report missing, zero, and negative denominators separately.
+
+Scope:
+- Prepare financial features for downstream screening.
+- Credit scoring and firm-level interpretation are performed in
+  Credit_Risk_Analysis.py.
 """
 
+from pathlib import Path
 import pandas as pd
 
-#Load raw slim data
-credit_raw_fs_slim = pd.read_csv(r"C:\Users\minec\credit_raw_fs_slim.csv")
+
+# 1. Set project paths and load financial statement data
+if "__file__" in globals():
+    BASE_DIR = Path(__file__).resolve().parent
+else:
+    BASE_DIR = Path.cwd()
+
+DATA_DIR = BASE_DIR / "data"
+
+credit_raw_fs_slim = pd.read_csv(
+    DATA_DIR / "credit_raw_fs_slim.csv",
+    dtype={
+        "corp_code": "string",
+        "stock_code": "string",
+    },
+)
+
+print(credit_raw_fs_slim.shape)
+print(credit_raw_fs_slim.dtypes)
 
 
-core_fs = credit_raw_fs_slim[(credit_raw_fs_slim["sj_div"].isin(["BS", "IS", "CIS", "CF"])) &
-    (credit_raw_fs_slim["account_id"].str.startswith("ifrs-full_", na=False) |
-     credit_raw_fs_slim["account_id"].str.startswith("dart_", na=False))].copy()
+
+
+# 2. Select core financial statements and IFRS/DART account IDs
+core_fs = credit_raw_fs_slim[
+    credit_raw_fs_slim["sj_div"].isin(["BS", "IS", "CIS", "CF"])
+    & credit_raw_fs_slim["account_id"].str.startswith(
+        ("ifrs-full_", "dart_"),
+        na=False,
+    )
+].copy()
+
+print(f"Rows before filtering: {len(credit_raw_fs_slim):,}")
+print(f"Rows after filtering: {len(core_fs):,}")
+print(core_fs["sj_div"].value_counts())
 
 
 
 
-# Account presence table
+# 3. Summarize account presence
 """
-Logic:
-    - Drop duplicate occurrences within the same firm-year first,
-      so the counts reflect presence rather than repeated raw rows.
+Count each statement-account combination once per firm-year.
+Collect distinct account names for inspection.
 
 Interpretation:
-    - firm_year_count: number of firm-year observations in which the account appears
-    - firm_count: number of firms in which the account appears
-    - year_count: number of years in which the account appears
+    - firm_year_count: number of distinct firm-year observations
+      in which the statement-account combination appears
+    - firm_count: number of distinct firms
+    - year_count: number of distinct fiscal years
+
+Account presence does not guarantee a non-missing amount.
 """
 
-account_presence_core = (core_fs.drop_duplicates(["corp_code", "bsns_year", "sj_div", "account_id", "account_nm"])
-                         .groupby(["sj_div", "account_id", "account_nm"], dropna=False)
-                         .agg(firm_year_count=("corp_code", "size"), firm_count=("corp_code", "nunique"), year_count=("bsns_year", "nunique"))
-                         .reset_index().sort_values(["firm_count", "year_count", "firm_year_count"], ascending=[False, False, False])
-                         )
+account_keys = ["sj_div", "account_id"]
+
+# Count distinct firm-year occurrences.
+account_presence_core = (
+    core_fs
+    .drop_duplicates(["corp_code", "bsns_year"] + account_keys)
+    .groupby(account_keys, dropna=False)
+    .agg(
+        firm_year_count=("corp_code", "size"),
+        firm_count=("corp_code", "nunique"),
+        year_count=("bsns_year", "nunique"),
+    )
+    .reset_index()
+)
+
+# Collect the different names used for each statement-account combination.
+account_names = (
+    core_fs
+    .groupby(account_keys, dropna=False)
+    .agg(
+        account_names=(
+            "account_nm",
+            lambda names: " | ".join(sorted(names.dropna().unique())),
+        )
+    )
+    .reset_index()
+)
+
+account_presence_core = (
+    account_presence_core
+    .merge(
+        account_names,
+        on=account_keys,
+        how="left",
+        validate="one_to_one",
+    )
+    .sort_values(
+        ["firm_year_count", "firm_count", "year_count"],
+        ascending=False,
+    )
+    .reset_index(drop=True)
+)
+
+print(account_presence_core.head(5).to_string(index=False))
 
 
 
 
-# Screen candidate accounts
+# 4. Screen broadly for interest and finance-related accounts
 """
-This block is used because a direct interest-expense account was not clearly identified 
-from the account_presence_core table. Therefore, finance-related candidate accounts are screened
-using account_nm keywords to identify a practical proxy.
+Identify candidate accounts for interest expense and finance costs.
+Review their statement context and meaning before mapping.
 """
 
 interest_candidates = account_presence_core[
-    account_presence_core["account_nm"].str.contains("이자|금융비용|재무비용", na=False)
+    account_presence_core["sj_div"].isin(["CF", "CIS", "IS"])
+    & (
+        account_presence_core["account_names"].str.contains(
+            "이자|금융비용|금융원가|재무비용",
+            na=False,
+        )
+        | account_presence_core["account_id"].str.contains(
+            "Interest|FinanceCosts",
+            case=False,
+            na=False,
+        )
+    )
 ].copy()
 
-interest_candidates = interest_candidates.sort_values(
-    ["firm_year_count", "firm_count", "year_count"],
-    ascending=[False, False, False]
-)
+print(interest_candidates.to_string(index=False))
 
 
 
 
-# Manual mapping table for merging into core_fs
+# 5. Map financial statement accounts to analysis variables
 """
 Core variable set:
-    - 7 BS accounts
-    - 4 IS/CIS accounts
-    - 1 CF account
+    - 7 BS variables
+    - 4 IS/CIS variables
+    - 1 CF variable
 
-Note on finance_costs:
-    - ifrs-full_FinanceCosts may include broader finance-related costs beyond pure interest expense.
-      Therefore, the standardized name is finance_costs.
+Mapping uses the combination of sj_div and account_id.
 
-Note on IS/CIS overlap:
-    - Some firms report key income statement items in IS, others in CIS, so both are mapped.
+Finance costs:
+    - Use ifrs-full_FinanceCosts as a broader financing-cost measure.
+    - Do not treat finance_costs as pure interest expense.
+
+IS/CIS overlap:
+    - Map both statements to the same analysis variables.
+    - Resolve overlapping observations in the next step.
 """
 
-account_mapping = pd.DataFrame({
-    "sj_div": [
-        "BS", "BS", "BS", "BS", "BS", "BS", "BS",
-        "CIS", "IS",
-        "CIS", "IS",
-        "CIS", "IS",
-        "CIS", "IS",
-        "CF"
+account_mapping = pd.DataFrame(
+    [
+        # Balance sheet
+        ("BS", "ifrs-full_Assets", "total_assets"),
+        ("BS", "ifrs-full_Liabilities", "total_liabilities"),
+        ("BS", "ifrs-full_Equity", "total_equity"),
+        ("BS", "ifrs-full_CurrentAssets", "current_assets"),
+        ("BS", "ifrs-full_CurrentLiabilities", "current_liabilities"),
+        ("BS", "ifrs-full_CashAndCashEquivalents", "cash_and_cash_equivalents"),
+        ("BS", "ifrs-full_Inventories", "inventory"),
+
+        # Income statement / comprehensive income statement
+        ("CIS", "ifrs-full_Revenue", "revenue"),
+        ("IS", "ifrs-full_Revenue", "revenue"),
+        ("CIS", "dart_OperatingIncomeLoss", "operating_income"),
+        ("IS", "dart_OperatingIncomeLoss", "operating_income"),
+        ("CIS", "ifrs-full_ProfitLoss", "net_income"),
+        ("IS", "ifrs-full_ProfitLoss", "net_income"),
+        ("CIS", "ifrs-full_FinanceCosts", "finance_costs"),
+        ("IS", "ifrs-full_FinanceCosts", "finance_costs"),
+
+        # Cash flow statement
+        ("CF", "ifrs-full_CashFlowsFromUsedInOperatingActivities", "cfo"),
     ],
-    "account_id": [
-        "ifrs-full_Assets",
-        "ifrs-full_Liabilities",
-        "ifrs-full_Equity",
-        "ifrs-full_CurrentAssets",
-        "ifrs-full_CurrentLiabilities",
-        "ifrs-full_CashAndCashEquivalents",
-        "ifrs-full_Inventories",
+    columns=["sj_div", "account_id", "std_account"],
+)
 
-        "ifrs-full_Revenue", "ifrs-full_Revenue",
-        "dart_OperatingIncomeLoss", "dart_OperatingIncomeLoss",
-        "ifrs-full_ProfitLoss", "ifrs-full_ProfitLoss",
-        "ifrs-full_FinanceCosts", "ifrs-full_FinanceCosts",
-
-        "ifrs-full_CashFlowsFromUsedInOperatingActivities"
-    ],
-    "std_account": [
-        "total_assets",
-        "total_liabilities",
-        "total_equity",
-        "current_assets",
-        "current_liabilities",
-        "cash_and_cash_equivalents",
-        "inventory",
-
-        "revenue", "revenue",
-        "operating_income", "operating_income",
-        "net_income", "net_income",
-        "finance_costs", "finance_costs",
-
-        "cfo"
-    ]
-})
-
-# Merge mapping into core_fs
 fs_standardized_long = core_fs.merge(
     account_mapping,
     on=["sj_div", "account_id"],
-    how="inner"
+    how="inner",
+    validate="many_to_one",
 )
 
+print(fs_standardized_long["std_account"].value_counts())
 
 
 
-# Apply statement priority
+
+# 6. Inspect duplicates and compare IS/CIS amounts
 """
-Objective:
-    
-    - Resolve IS/CIS overlap when the same standardized account appears in both statements.
+Check for duplicate observations within the same statement before
+comparing IS and CIS.
 
-Current rule:
-    - BS, CF, and CIS are preferred
-    - IS is secondary
-
-if net_income exists in both CIS and IS for the same firm-year, the CIS value is kept.
-
-Interpretation:
-    - If both IS and CIS exist and diff is exactly zero, the overlap does not introduce distortion.
-    - If overlap count is zero, the priority rule is unlikely to distort values,
-      because the account is usually sourced from only one statement.
-    - If diff is materially non-zero, statement-specific mapping may need revision.
+Compare amounts only when both statements have non-missing values.
+Actual observation selection is performed in the next step.
 """
 
 statement_priority = {"BS": 1, "CF": 1, "CIS": 1, "IS": 2}
-fs_standardized_long["statement_priority"] = fs_standardized_long["sj_div"].map(statement_priority)
 
+fs_standardized_long["statement_priority"] = (
+    fs_standardized_long["sj_div"].map(statement_priority)
+)
 
 fs_standardized_long_before_dedupe = fs_standardized_long.copy()
 
-def compare_is_cis(fs_long_before_dedupe: pd.DataFrame, std_account_name: str):
-    
-    temp = fs_long_before_dedupe[fs_long_before_dedupe["std_account"] == std_account_name].copy()
 
-    temp = temp[temp["sj_div"].isin(["IS", "CIS"])]
+# Check duplicates within the same statement.
+statement_keys = ["corp_code", "bsns_year", "std_account", "sj_div"]
 
-    check = (temp.pivot_table(
+within_statement_duplicates = fs_standardized_long_before_dedupe[
+    fs_standardized_long_before_dedupe.duplicated(
+        statement_keys,
+        keep=False,
+    )
+].sort_values(statement_keys)
+
+if not within_statement_duplicates.empty:
+    print(
+        within_statement_duplicates[
+            statement_keys + ["account_id", "account_nm", "thstrm_amount"]
+        ].to_string(index=False)
+    )
+    raise ValueError(
+        "Review duplicate accounts within the same statement before comparison."
+    )
+
+
+def compare_is_cis(
+    fs_long_before_dedupe: pd.DataFrame,
+    std_account_name: str,
+) -> pd.DataFrame:
+
+    temp = fs_long_before_dedupe[
+        fs_long_before_dedupe["std_account"].eq(std_account_name)
+        & fs_long_before_dedupe["sj_div"].isin(["IS", "CIS"])
+    ].copy()
+
+    check = (
+        temp.pivot(
             index=["corp_code", "bsns_year"],
             columns="sj_div",
             values="thstrm_amount",
-            aggfunc="first").reset_index())
+        )
+        .reindex(columns=["IS", "CIS"])
+        .reset_index()
+    )
+
+    both_available = check[["IS", "CIS"]].notna().all(axis=1)
+    check["diff"] = check["CIS"] - check["IS"]
+
+    different_amounts = both_available & check["diff"].ne(0)
 
     print(f"\n=== {std_account_name} ===")
+    print(f"Firm-years with both amounts: {both_available.sum()}")
+    print(f"Firm-years with different amounts: {different_amounts.sum()}")
 
-    if {"IS", "CIS"}.issubset(check.columns): 
-        check["diff"] = check["CIS"] - check["IS"]
-        print(check["diff"].describe())
-    else:
-        print("IS and CIS do not both exist in the pivoted result.")
+    if both_available.any():
+        print(check.loc[both_available, "diff"].describe())
+
+    if different_amounts.any():
+        print(check.loc[different_amounts].to_string(index=False))
 
     return check
 
-check_net_income = compare_is_cis(fs_standardized_long_before_dedupe, "net_income")
-check_revenue = compare_is_cis(fs_standardized_long_before_dedupe, "revenue")
-check_operating_income = compare_is_cis(fs_standardized_long_before_dedupe, "operating_income")
-check_finance_costs = compare_is_cis(fs_standardized_long_before_dedupe, "finance_costs")
 
+check_net_income = compare_is_cis(
+    fs_standardized_long_before_dedupe, "net_income"
+)
+check_revenue = compare_is_cis(
+    fs_standardized_long_before_dedupe, "revenue"
+)
+check_operating_income = compare_is_cis(
+    fs_standardized_long_before_dedupe, "operating_income"
+)
+check_finance_costs = compare_is_cis(
+    fs_standardized_long_before_dedupe, "finance_costs"
+)
+
+
+
+
+# 7. Select one observation per firm-year and analysis variable
 """
-Result interpretation:
-    - net_income showed overlapping IS and CIS observations, and the values were identical.
-    - revenue, operating_income, and finance_costs showed no overlapping firm-year observations between IS and CIS.
+Prefer non-missing current-period amounts.
+When availability is equal, apply statement priority.
+Keep one row even when all candidate amounts are missing.
 """
 
+fs_standardized_long = (
+    fs_standardized_long_before_dedupe
+    .assign(
+        amount_missing=lambda df: df["thstrm_amount"].isna()
+    )
+    .sort_values(
+        [
+            "corp_code",
+            "bsns_year",
+            "std_account",
+            "amount_missing",
+            "statement_priority",
+        ]
+    )
+    .drop_duplicates(
+        subset=["corp_code", "bsns_year", "std_account"],
+        keep="first",
+    )
+    .drop(columns=["amount_missing"])
+    .copy()
+)
+
+print(fs_standardized_long["std_account"].value_counts())
 
 
 
-# Keep only one observation per firm-year-standard account based on the priority rule above.
-fs_standardized_long = (fs_standardized_long
-                        .sort_values(["corp_code", "bsns_year", "std_account", "statement_priority"])
-                        .drop_duplicates(subset=["corp_code", "bsns_year", "std_account"], keep="first")
-                        .copy())
 
+# 8. Build the firm-year financial statement panel
+credit_fs_wide = (
+    fs_standardized_long
+    .pivot(
+        index=[
+            "corp_code",
+            "stock_code",
+            "corp_name_master",
+            "industry_krx",
+            "bsns_year",
+        ],
+        columns="std_account",
+        values="thstrm_amount",
+    )
+    .reset_index()
+)
 
+credit_fs_wide.columns.name = None
 
-
-# Validation - duplicate check after priority dedupe
-dup_check = (fs_standardized_long
-             .groupby(["corp_code", "bsns_year", "std_account"])
-             .size()
-             .reset_index(name="n"))
-
-# empty result = no duplicate firm-year-standard account remains
-print(dup_check[dup_check["n"] > 1])
-
-
-
-
-# Pivot to wide format. Build a one-row-per-firm-year panel
-"""
-fs_standardized_long is a long-format table:
-    
-    each row represents one standardized account for one firm-year.
-
-credit_fs_wide is a wide-format table:
-    
-    each row represents one firm-year, and each standardized account 
-    becomes a separate column.
-
-Therefore:
-    
-    the row count decreases because multiple account rows for the same firm-year 
-    are collapsed into a single row, the column count increases because 
-    std_account values are expanded into separate variables.
-"""
-credit_fs_wide = (fs_standardized_long
-                  .pivot(index=["corp_code", "stock_code", "corp_name_master", "industry_krx", "bsns_year"],
-                         columns="std_account",
-                         values="thstrm_amount").reset_index())
-
-# Missing Values by Column
+print(f"Panel shape: {credit_fs_wide.shape}")
 print(credit_fs_wide.isna().sum().sort_values(ascending=False))
 
+
+
+
+# 9. Calculate core financial ratios
 """
-std_account
-finance_costs                44
-cfo                          15
-net_income                   10
-inventory                     7
-cash_and_cash_equivalents     7
-revenue                       5
-total_equity                  2
-operating_income              1
-corp_code                     0
-total_assets                  0
-current_liabilities           0
-stock_code                    0
-current_assets                0
-bsns_year                     0
-industry_krx                  0
-corp_name_master              0
-total_liabilities             0
-dtype: int64
+Calculate ratios only when denominators are positive.
+Preserve negative numerators and missing values.
 
-
-A small number of missing values remain, mainly in finance_costs, cfo, and net_income.
-BS coverage is very strong, and the missing counts in the core panel are low enough
-for a first-stage credit-risk feature set. Therefore, the overall wide panel is 
-considered sufficiently usable for analysis.
+Definitions:
+    - ROA and ROE use year-end assets and equity.
+    - Quick ratio uses current assets less inventory.
+    - Finance-cost coverage uses operating income / finance costs,
+      not a pure interest coverage ratio.
 """
 
+# Keep the original financial amounts unchanged.
+assets = credit_fs_wide["total_assets"].where(
+    credit_fs_wide["total_assets"] > 0
+)
+liabilities = credit_fs_wide["total_liabilities"].where(
+    credit_fs_wide["total_liabilities"] > 0
+)
+equity = credit_fs_wide["total_equity"].where(
+    credit_fs_wide["total_equity"] > 0
+)
+current_liabilities = credit_fs_wide["current_liabilities"].where(
+    credit_fs_wide["current_liabilities"] > 0
+)
+revenue = credit_fs_wide["revenue"].where(
+    credit_fs_wide["revenue"] > 0
+)
+finance_costs = credit_fs_wide["finance_costs"].where(
+    credit_fs_wide["finance_costs"] > 0
+)
 
-
-
-# Calculate core financial ratios
 credit_fs_wide["liabilities_to_assets"] = (
-    credit_fs_wide["total_liabilities"] / credit_fs_wide["total_assets"]
+    credit_fs_wide["total_liabilities"] / assets
 )
 
 credit_fs_wide["equity_ratio"] = (
-    credit_fs_wide["total_equity"] / credit_fs_wide["total_assets"]
+    credit_fs_wide["total_equity"] / assets
 )
 
 credit_fs_wide["current_ratio"] = (
-    credit_fs_wide["current_assets"] / credit_fs_wide["current_liabilities"]
+    credit_fs_wide["current_assets"] / current_liabilities
 )
 
 credit_fs_wide["quick_ratio"] = (
-    (credit_fs_wide["current_assets"] - credit_fs_wide["inventory"]) /
-    credit_fs_wide["current_liabilities"]
+    (credit_fs_wide["current_assets"] - credit_fs_wide["inventory"])
+    / current_liabilities
 )
 
 credit_fs_wide["cash_ratio"] = (
-    credit_fs_wide["cash_and_cash_equivalents"] / credit_fs_wide["current_liabilities"]
+    credit_fs_wide["cash_and_cash_equivalents"] / current_liabilities
 )
 
-credit_fs_wide["roa"] = (
-    credit_fs_wide["net_income"] / credit_fs_wide["total_assets"]
-)
+credit_fs_wide["roa"] = credit_fs_wide["net_income"] / assets
 
-credit_fs_wide["roe"] = (
-    credit_fs_wide["net_income"] / credit_fs_wide["total_equity"]
-)
+credit_fs_wide["roe"] = credit_fs_wide["net_income"] / equity
 
 credit_fs_wide["operating_margin"] = (
-    credit_fs_wide["operating_income"] / credit_fs_wide["revenue"]
+    credit_fs_wide["operating_income"] / revenue
 )
 
 credit_fs_wide["finance_cost_coverage"] = (
-    credit_fs_wide["operating_income"] / credit_fs_wide["finance_costs"]
+    credit_fs_wide["operating_income"] / finance_costs
 )
 
-credit_fs_wide["cfo_to_assets"] = (
-    credit_fs_wide["cfo"] / credit_fs_wide["total_assets"]
-)
+credit_fs_wide["cfo_to_assets"] = credit_fs_wide["cfo"] / assets
 
-credit_fs_wide["cfo_to_liabilities"] = (
-    credit_fs_wide["cfo"] / credit_fs_wide["total_liabilities"]
-)
+credit_fs_wide["cfo_to_liabilities"] = credit_fs_wide["cfo"] / liabilities
 
+
+
+
+# 10. Summarize financial ratios
 """
-The number of ratios does not need to match the number of standardized accounts.
-A single account can be reused across multiple ratios, and some accounts serve mainly 
-as denominators or supporting inputs. Therefore, 12 standardized accounts can reasonably produce 11 core ratios.
-"""
-
-
-# Validation - ratio summary statistics
-"""
-Interpretation guide:
-    
-    - high current_ratio / quick_ratio / cash_ratio can still be valid
-    - roe and finance_cost_coverage can become extreme when denominators are small
-    - negative values may naturally arise from losses, negative CFO, or negative operating income
+Inspect ratio distributions and missingness after denominator treatment.
+Extreme ratios are not automatically treated as errors.
 """
 
 ratio_cols = [
@@ -368,87 +480,95 @@ ratio_cols = [
     "operating_margin",
     "finance_cost_coverage",
     "cfo_to_assets",
-    "cfo_to_liabilities"
+    "cfo_to_liabilities",
 ]
 
 ratio_summary = credit_fs_wide[ratio_cols].describe().T
-
-ratio_summary = ratio_summary[["count", "mean", "std", "min", "25%", "50%", "75%", "max"]]
+ratio_summary["missing_count"] = (
+    credit_fs_wide[ratio_cols].isna().sum()
+)
 
 print(ratio_summary)
 
+
+
+
+# 11. Check balance sheet consistency
 """
-Most ratio distributions appear economically plausible. Some ratios, 
-especially finance_cost_coverage, can show extreme values because the denominator may be very small.
-At this stage, the summary is used as a first-pass screening tool rather than a final outlier treatment step.
-"""
+Check the accounting identity: assets = liabilities + equity.
 
+bs_check:
+    Signed difference in reported monetary units.
 
+bs_check_relative:
+    Absolute difference divided by positive total assets.
 
-
-# Balance sheet consistency check (absolute difference)
-credit_fs_wide["bs_check"] = (credit_fs_wide["total_assets"] 
-                              - (credit_fs_wide["total_liabilities"] 
-                              + credit_fs_wide["total_equity"]))
-
-print(credit_fs_wide["bs_check"].describe())
-
-"""
-The absolute BS difference is essentially zero for almost all observations. Only one visible 
-non-zero case appears, but it should be interpreted together with the relative BS check below.
+Missing inputs remain missing and are not treated as successful checks.
 """
 
+credit_fs_wide["bs_check"] = (
+    credit_fs_wide["total_assets"]
+    - credit_fs_wide["total_liabilities"]
+    - credit_fs_wide["total_equity"]
+)
 
+credit_fs_wide["bs_check_relative"] = (
+    credit_fs_wide["bs_check"].abs()
+    / credit_fs_wide["total_assets"].where(
+        credit_fs_wide["total_assets"] > 0
+    )
+)
 
+print("\nBalance sheet consistency:")
+print(
+    credit_fs_wide[
+        ["bs_check", "bs_check_relative"]
+    ].describe()
+)
 
-# Basic denominator sanity checks
-print((credit_fs_wide["total_equity"] <= 0).sum())
-print((credit_fs_wide["finance_costs"] <= 0).sum())
-
-"""
-No observations have non-positive total_equity, so ROE interpretation is relatively clean.
-Three observations have non-positive finance_costs, so finance_cost_coverage 
-should be interpreted with caution for those cases.
-"""
-
-
-
-
-# Optional safety check for finance_cost_coverage
-"""
-finance_costs receives additional attention because:
-    
-    1. it is the denominator of finance_cost_coverage,
-    2. small denominator values can create extreme ratio values,
-    3. it is a proxy variable rather than a pure interest-expense measure,
-    4. its coverage is weaker than the core BS accounts.
-
-In the current sample, three observations have negative finance_costs.
-All remaining observed values are either positive or NaN.
-Therefore, finance_cost_coverage is set to NaN when finance_costs <= 0
-to avoid economically misleading coverage values.
-"""
-
-credit_fs_wide.loc[credit_fs_wide["finance_costs"] <= 0, "finance_cost_coverage"] = pd.NA
-
-
-
-
-# Save outputs
-credit_fs_wide.to_csv(
-    r"C:\Users\minec\credit_features.csv",
-    index=False,
-    encoding="utf-8-sig"
+print(
+    "Firm-years without a relative BS check:",
+    credit_fs_wide["bs_check_relative"].isna().sum(),
 )
 
 
 
 
-# This file will serve as the input for Credit_Risk_Analysis.py.
+
+# 12. Summarize denominator conditions
+"""
+Report missing, zero, and negative denominators separately.
+Non-positive denominators were excluded from ratio calculations above.
+"""
+
+denominator_cols = [
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
+    "current_liabilities",
+    "revenue",
+    "finance_costs",
+]
+
+denominator_check = pd.DataFrame({
+    "missing_count": credit_fs_wide[denominator_cols].isna().sum(),
+    "zero_count": credit_fs_wide[denominator_cols].eq(0).sum(),
+    "negative_count": credit_fs_wide[denominator_cols].lt(0).sum(),
+})
+
+print("\nDenominator conditions:")
+print(denominator_check)
 
 
 
 
+# 13. Save the financial features for downstream analysis
+output_path = DATA_DIR / "credit_features.csv"
 
+credit_fs_wide.to_csv(
+    output_path,
+    index=False,
+    encoding="utf-8-sig",
+)
 
-
+print(f"\nSaved to: {output_path}")
